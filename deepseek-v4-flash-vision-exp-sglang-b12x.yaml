@@ -1,0 +1,125 @@
+# DeepSeek V4 Flash Vision-Exp — SGLang (official DGX-Spark B12X recipe)
+#
+# Port of the official SGLang DGX Spark cell (variant=flash-vision&quant=fp4&
+# strategy=balanced&nodes=multi-2) to a sparkrun recipe. Uses the DGX Spark-only
+# preview image (lmsysorg/sglang:dev-v4f-2dgx-v2) — the docs say NOT to use it
+# on non-DGX-Spark hardware. B12X + DSV4 are baked into the image and enabled
+# via the env vars below, plus five small mods (see mods: list).
+#
+# REQUIREMENTS PER HOST: 64GB of system swap. The FP8->FP4 shared-expert
+# conversion at load time stages through host memory; without swap the loader
+# OOMs (even with the thread-cap mod). E.g.:
+#   fallocate -l 64G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+#
+# sparkrun's sglang runtime auto-appends --dist-init-addr <head>:25000,
+# --nnodes <N> and per-node --node-rank, so those are deliberately omitted here.
+# sparkrun also auto-detects the per-host IB HCA, so NCCL_IB_HCA /
+# NCCL_SOCKET_IFNAME / GID are not set. The NCCL CUMEM/NVLS disables below are
+# kept off to match the official card; enable them only if your fabric needs it.
+
+recipe_version: '2'
+name: deepseek-v4-flash-vision-exp-sglang-b12x
+description: DeepSeek-V4-Flash-Vision-Exp on SGLang (official DGX-Spark B12X recipe, DSPARK spec, TP=2, k context 393216)
+model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+runtime: sglang
+container: lmsysorg/sglang:dev-v4f-2dgx-v2
+min_nodes: 2
+max_nodes: 2
+
+# Weight-load OOM workaround: cap the DSV4 weight-load ThreadPoolExecutor
+# (deepseek_v4.py) to reduce concurrent H2D staging. Works together with the
+# required 64G system swap (see header) — neither alone is sufficient.
+# DSV4 image-tools: re-associate the  image token (emitted by the model in a
+# tool-call response) with image content blocks so the dsv4 tool-call encoding
+# doesn't reject it. See mods/sglang-dsv4-image-tools/run.sh.
+# DSV4 fnshape: tolerate OpenAI-function-shaped DSML bodies
+# ({"arguments": {...}} instead of bare params), which the model emits once
+# tool history exists. See mods/sglang-dsv4-fnshape/run.sh.
+# DSV4 thinking: prompt for thinking by default + force reasoning separation,
+# so the model deliberates (vLLM parity) and clients get reasoning blocks.
+# See mods/sglang-dsv4-thinking/run.sh.
+# DSV4 sampling: official temperature=1.0/top_p=0.95 defaults (mirrors eugr
+# override-generation-config; sglang has no such flag). See
+# mods/sglang-dsv4-sampling/run.sh.
+mods:
+  - mods/sglang-weight-load-cap
+  - mods/sglang-dsv4-image-tools
+  - mods/sglang-dsv4-fnshape
+  - mods/sglang-dsv4-thinking
+  - mods/sglang-dsv4-sampling
+
+metadata:
+  description: "SGLang serving deepseek-ai/DeepSeek-V4-Flash-Vision-Exp on dual Sparks (official DGX-Spark B12X recipe: moe-runner-backend b12x, DSPARK spec decode, chunked prefill 8192, context 393216)"
+
+defaults:
+  port: 30000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  max_model_len: 393216
+  served_model_name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+  max_num_seqs: 32
+  chunked_prefill_size: 8192
+  swa_full_tokens_ratio: 0.2
+  cuda_graph_max_bs_decode: 32
+
+env:
+  SGLANG_SM120_FLASHMLA_BACKEND: b12x
+  B12X_MLA_SM120_DSV4_H16_NATIVE: "1"
+  SGLANG_OPT_FUSE_MHC_POST_PRE: "1"
+  SGLANG_OPT_FP8_WO_A_GEMM: "1"
+  SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK: "1"
+  SGLANG_B12X_MAX_TOKENS: "8192"
+  # SGLANG_B12X_MOE_QUANT_MODE deliberately omitted — not in the official recipe.
+  # It was a no-op workaround for the FP8->FP4 shared-expert OOM; the 64G swap
+  # (see header) + weight-load thread cap mod handle that instead.
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # SGLANG_DEFAULT_THINKING=1: with no chat template, the dsv4 prompt otherwise
+  # ends every assistant turn with </think> (thinking structurally disabled).
+  # Enabled, the prompt ends with <think> so the model deliberates like the
+  # vLLM serving does. Pairs with --reasoning-parser deepseek-v4 below and
+  # the sglang-dsv4-thinking mod (force separation without client kwargs).
+  SGLANG_DEFAULT_THINKING: "1"
+  # Reasoning effort default "high": matches common agentic serving setups
+  # (temperature=1.0/top_p=0.95 with high effort). Profile is
+  # checkpoint-resolved ("official" for Vision-Exp), where high = the
+  # high-effort prompt preamble.
+  SGLANG_DSV4_REASONING_EFFORT: "high"
+  # NCCL disables kept off to match the official card; enable only if your
+  # fabric needs them.
+  #NCCL_CUMEM_ENABLE: "0"
+  #NCCL_NVLS_ENABLE: "0"
+
+# --tool-call-parser deepseekv4: sglang's auto-detection can't resolve the DSV4
+# tool-call parser for this checkpoint (no HF chat template found; tokenizer
+# loads as TokenizersBackend), so tool calls would otherwise come back as raw
+# <tool_calls> text. Set it explicitly (CLI enum key 'deepseekv4'). The
+# sglang-dsv4-image-tools mod makes it coexist with image content blocks.
+# --reasoning-parser deepseek-v4: separate thinking into reasoning blocks
+# (else it streams as plain output and clients never see reasoning_content).
+# NOTE THE SPELLINGS: tool parser is 'deepseekv4' (no hyphen), reasoning
+# parser is 'deepseek-v4' (hyphen) — two different registries. The
+# sglang-dsv4-thinking mod forces separation without client kwargs.
+command: |
+  sglang serve \
+    --model-path {model} \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --tp-size {tensor_parallel} \
+    --moe-runner-backend b12x \
+    --speculative-algorithm DSPARK \
+    --chunked-prefill-size {chunked_prefill_size} \
+    --context-length {max_model_len} \
+    --mem-fraction-static {gpu_memory_utilization} \
+    --swa-full-tokens-ratio {swa_full_tokens_ratio} \
+    --cuda-graph-max-bs-decode {cuda_graph_max_bs_decode} \
+    --max-running-requests {max_num_seqs} \
+    --tool-call-parser deepseekv4 \
+    --reasoning-parser deepseek-v4 \
+    --enable-metrics \
+    --trust-remote-code
+
+executor_config:
+  cap_add:
+    - SYS_PTRACE
